@@ -1,103 +1,89 @@
 import requests
 import json
 import re
-from tqdm import tqdm
-import threading
-import pandas as pd
+from multiprocessing import Pool
 import os
+from tqdm import tqdm
 
-files_endpt = "https://api.gdc.cancer.gov/files"
-
-fields = [
-    "file_name",
-    "cases.disease_type",
-    "cases.project.project_id"
-]
-
-fields = ",".join(fields)
 
 files_endpt = "https://api.gdc.cancer.gov/files"
 data_endpt = "https://api.gdc.cancer.gov/data"
 
-# This set of filters is nested under an 'and' operator.
-filters = {
-    "op": "and",
-    "content":[
-        {
-            "op": "in",
-            "content":{
-                "field": "cases.project.project_id",
-                "value": ["TCGA-LUAD","TCGA-LUSC"]
-            }
-        },
-        {
-            "op": "in",
-            "content":{
-                "field": "files.data_format",
-                "value": ["svs"]
-            }
-        },
-        {
-            "op": "in",
-            "content":{
-                "field": "files.experimental_strategy",
-                "value": ["Diagnostic Slide"]
-            }
-        }
-    ]
-}
-
-# Here a GET is used, so the filter parameters should be passed as a JSON string.
-params = {
-    "filters": json.dumps(filters),
-    "fields": fields,
-    "format": "JSON",
-    "size": "2000"
-}
-
-response = requests.get(files_endpt, params=params)
-
-
-def mthread(params, cases):
-    response = requests.post(data_endpt, data=json.dumps(params), headers={"Content-Type": "application/json"})
-    response_head_cd = response.headers["Content-Disposition"]
-    file_name = re.findall("filename=(.+)", response_head_cd)[0]
+def download_file(file_entry):
+    params = {"ids": file_entry["id"]}
 
     # Extract the class/project ID from the params
-    project_id = cases
+    project_id = file_entry['cases'][0]['project']['project_id']
+
+    file_name = file_entry["file_name"]
 
     # Create a directory for the class/project if it doesn't exist
     directory = os.path.join("./data", project_id)
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+    os.makedirs(directory, exist_ok=True)
+    
+    response = requests.post(data_endpt, data=json.dumps(params), headers={"Content-Type": "application/json"})
 
     # Save the file in the respective directory
     file_path = os.path.join(directory, file_name)
 
+    print(f"==> Downloading {file_name}")
     with open(file_path, "wb") as output_file:
-        output_file.write(response.content)
+        total_size = int(response.headers.get("content-length", 0))
+        block_size = 1024
+        progress_bar = tqdm(total=total_size, unit="B", unit_scale=True)
+        for data in response.iter_content(block_size):
+            output_file.write(data)
+            progress_bar.update(len(data))
+        progress_bar.close()
 
+def process_files(filters):
+    fields = [
+        "file_name",
+        "cases.disease_type",
+        "cases.project.project_id"
+    ]
+    fields = ",".join(fields)
 
-t = []
-i = 0
-j = 0
-batch_size = 4  # Number of threads to join in each batch
-file_entries = json.loads(response.content.decode("utf-8"))["data"]["hits"]
-df = pd.DataFrame(file_entries)
-df1 = pd.concat([pd.DataFrame({'id': df.iloc[i]['id'], 'cases': df.iloc[i]['cases'][0]['project']['project_id']}, index=[0])
-                for i in range(len(df))], ignore_index=True)
+    params = {
+        "filters": json.dumps(filters),
+        "fields": fields,
+        "format": "JSON",
+        "size": "2000"
+    }
 
-# This step populates the download list with the file_ids from the previous query
-for i in tqdm(range(len(df1))):
-    params = {"ids": df1.iloc[i]["id"]}
-    t.append(threading.Thread(target=mthread, args=(params, df1.iloc[i]['cases'])))
-    t[i].start()
-    if i % batch_size == 0 and i > 0:
-        for thread in t[j:i+1]:
-            thread.join()
-        j = i + 1
-    i += 1
+    response = requests.get(files_endpt, params=params)
 
-# Join any remaining threads
-for thread in t[j:]:
-    thread.join()
+    file_entries = json.loads(response.content.decode("utf-8"))["data"]["hits"]
+
+    with Pool(processes=8) as pool:
+        pool.map(download_file, file_entries)
+
+if __name__ == "__main__":
+    filters = {
+        "op": "and",
+        "content": [
+            {
+                "op": "in",
+                "content": {
+                    "field": "cases.project.project_id",
+                    "value": ["TCGA-LUAD", "TCGA-LUSC"]
+                }
+            },
+            {
+                "op": "in",
+                "content": {
+                    "field": "files.data_format",
+                    "value": ["svs"]
+                }
+            },
+            {
+                "op": "in",
+                "content": {
+                    "field": "files.experimental_strategy",
+                    "value": ["Diagnostic Slide"]
+                }
+            }
+        ]
+    }
+
+    process_files(filters)
